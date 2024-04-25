@@ -1,129 +1,160 @@
 import torch
-if torch.backends.mps.is_available():  # Check for Apple Silicon GPU availability (requires PyTorch 1.12 or later)
-    device = torch.device("mps")
-elif torch.cuda.is_available():  # Check for NVIDIA GPU availability
-    device = torch.device("cuda")
-else:
-    device = torch.device("cpu")  # Fall back to CPU
-print(f"Using device: {device}")
-
-from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModel, T5ForConditionalGeneration, AdamW
-from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
-from peft import LoraConfig, get_peft_model
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from sentence_transformers import SentenceTransformer
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
+import faiss
+import numpy as np
+import pandas as pd
 
-# Prepare the dataset
+# Custom dataset class
 class MSMARCODataset(Dataset):
-    def __init__(self, dataset, tokenizer_query, tokenizer_passage, tokenizer_answer, max_length):
-        self.queries = [q for q in dataset["train"]["query"]]
-        self.passages = [p["passage_text"] for p in dataset["train"]["passages"]]
-        self.answers = [a["answer"] for a in dataset["train"]["wellFormedAnswers"]]
-        self.tokenizer_query = tokenizer_query
-        self.tokenizer_passage = tokenizer_passage
-        self.tokenizer_answer = tokenizer_answer
-        self.max_length = max_length
+    def __init__(self, data):
+        self.data = data
 
     def __len__(self):
-        return len(self.queries)
+        return len(self.data)
 
     def __getitem__(self, idx):
-        query = self.queries[idx]
-        passage = self.passages[idx]
-        answer = self.answers[idx]
+        item = self.data.iloc[idx]
+        query = item['query']
+        passages = item['passages']
+        target = item['wellFormedAnswers'][0]
+        return query, passages, target
 
-        query_inputs = self.tokenizer_query(query, truncation=True, padding="max_length", max_length=self.max_length, return_tensors="pt")
-        passage_inputs = self.tokenizer_passage(passage, truncation=True, padding="max_length", max_length=self.max_length, return_tensors="pt")
-        answer_inputs = self.tokenizer_answer(answer, truncation=True, padding="max_length", max_length=self.max_length, return_tensors="pt")
+# Load and preprocess the dataset
+def load_data(file_path):
+    data = pd.read_json(file_path, lines=True)
+    data = data[['query', 'passages', 'wellFormedAnswers']]
+    data = data[data['wellFormedAnswers'].map(len) > 0]
+    data = data[data['passages'].map(len) > 0]
+    data = data[data['query'].map(len) > 0]
+    return data
 
-        return {
-            "query_input_ids": query_inputs["input_ids"].squeeze(),
-            "query_attention_mask": query_inputs["attention_mask"].squeeze(),
-            "passage_input_ids": passage_inputs["input_ids"].squeeze(),
-            "passage_attention_mask": passage_inputs["attention_mask"].squeeze(),
-            "answer_input_ids": answer_inputs["input_ids"].squeeze(),
-            "answer_attention_mask": answer_inputs["attention_mask"].squeeze(),
-        }
+# Initialize the models
+query_encoder = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+doc_encoder = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+llm = GPT2LMHeadModel.from_pretrained('gpt2')
+tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
 
-# Load the MS MARCO dataset
-dataset = load_dataset("ms_marco", "v1.1")
+# Create a FAISS index
+def create_index(passages):
+    embeddings = doc_encoder.encode(passages)
+    index = faiss.IndexFlatIP(embeddings.shape[1])
+    index.add(embeddings)
+    return index
 
-# Initialize tokenizers
-tokenizer_query = AutoTokenizer.from_pretrained("sentence-transformers/bert-base-nli-mean-tokens")
-tokenizer_passage = AutoTokenizer.from_pretrained("sentence-transformers/bert-base-nli-mean-tokens")
-tokenizer_answer = AutoTokenizer.from_pretrained("t5-base")
+# Retrieve top-k passages
+def retrieve_passages(query, index, k=5):
+    query_embedding = query_encoder.encode([query])
+    distances, indices = index.search(query_embedding, k)
+    return distances[0], indices[0]
 
-# Create the dataset
-max_length = 512
-dataset = MSMARCODataset(dataset, tokenizer_query, tokenizer_passage, tokenizer_answer, max_length)
+# Generate a response using the LLM
+def generate_response(query, passage, max_length=100):
+    input_text = f"Query: {query}\nPassage: {passage}\nResponse:"
+    input_ids = tokenizer.encode(input_text, return_tensors='pt')
+    output = llm.generate(input_ids, max_length=max_length, num_return_sequences=1)
+    response = tokenizer.decode(output[0], skip_special_tokens=True)
+    return response
 
-# Initialize the query encoder (Q)
-query_encoder = AutoModel.from_pretrained("sentence-transformers/bert-base-nli-mean-tokens").to(device)
+# Compute the weighted average of responses
+def weighted_average(responses, weights):
+    weighted_responses = torch.tensor([response * weight for response, weight in zip(responses, weights)])
+    return torch.sum(weighted_responses, dim=0)
 
-# Initialize the document encoder (D)
-document_encoder = AutoModel.from_pretrained("sentence-transformers/bert-base-nli-mean-tokens").to(device)
+# Training loop
+def train(model, dataloader, optimizer, criterion, device):
+    model.train()
+    for batch in dataloader:
+        queries, passages_list, targets = batch
+        queries = list(queries)
+        targets = list(targets)
 
-# Initialize the generator (P)
-generator = T5ForConditionalGeneration.from_pretrained("t5-base").to(device)
+        all_passages = [passage for passages in passages_list for passage in passages]
+        index = create_index(all_passages)
 
-# Apply LoRA to the query encoder and generator
-lora_config = LoraConfig(r=8, lora_alpha=16, target_modules=["q", "v"])
-query_encoder = get_peft_model(query_encoder, lora_config)
-generator = get_peft_model(generator, lora_config)
+        batch_loss = 0
+        for query, passages, target in zip(queries, passages_list, targets):
+            distances, indices = retrieve_passages(query, index)
+            weights = nn.functional.softmax(torch.tensor(distances), dim=0)
 
-# Define the training loop
-def train(query_encoder, generator, dataset, epochs, batch_size, learning_rate):
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    
-    optimizer_query = AdamW(query_encoder.parameters(), lr=learning_rate)
-    optimizer_generator = AdamW(generator.parameters(), lr=learning_rate)
-    
-    query_encoder.train()
-    generator.train()
-    
-    for epoch in range(epochs):
+            responses = []
+            for idx in indices:
+                passage = all_passages[idx]
+                response = generate_response(query, passage)
+                responses.append(tokenizer.encode(response, return_tensors='pt'))
+
+            weighted_response = weighted_average(responses, weights)
+            target_ids = tokenizer.encode(target, return_tensors='pt')
+
+            loss = criterion(weighted_response.unsqueeze(0), target_ids.unsqueeze(0))
+            batch_loss += loss.item()
+
+        optimizer.zero_grad()
+        batch_loss.backward()
+        optimizer.step()
+
+# Evaluation loop
+def evaluate(model, dataloader, device):
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
         for batch in dataloader:
-            # Move batch tensors to the selected device
-            batch = {k: v.to(device) for k, v in batch.items()}
-            
-            # Train the query encoder
-            query_inputs = {
-                "input_ids": batch["query_input_ids"],
-                "attention_mask": batch["query_attention_mask"]
-            }
-            query_embeddings = query_encoder(**query_inputs).last_hidden_state[:, 0, :]
-            
-            passage_inputs = {
-                "input_ids": batch["passage_input_ids"],
-                "attention_mask": batch["passage_attention_mask"]
-            }
-            passage_embeddings = document_encoder(**passage_inputs).last_hidden_state[:, 0, :]
-            
-            # Compute the contrastive loss
-            contrastive_loss = nn.CrossEntropyLoss()(query_embeddings, passage_embeddings)
-            
-            optimizer_query.zero_grad()
-            contrastive_loss.backward()
-            optimizer_query.step()
-            
-            # Train the generator
-            answer_inputs = {
-                "input_ids": batch["answer_input_ids"],
-                "attention_mask": batch["answer_attention_mask"]
-            }
-            outputs = generator(**answer_inputs, labels=answer_inputs["input_ids"])
-            
-            generative_loss = outputs.loss
-            
-            optimizer_generator.zero_grad()
-            generative_loss.backward()
-            optimizer_generator.step()
-        
-        print(f"Epoch [{epoch+1}/{epochs}], Contrastive Loss: {contrastive_loss.item()}, Generative Loss: {generative_loss.item()}")
+            queries, passages_list, targets = batch
+            queries = list(queries)
+            targets = list(targets)
 
-# Train the models
-epochs = 3
-batch_size = 8
-learning_rate = 1e-5
+            all_passages = [passage for passages in passages_list for passage in passages]
+            index = create_index(all_passages)
 
-train(query_encoder, generator, dataset, epochs, batch_size, learning_rate)
+            batch_loss = 0
+            for query, passages, target in zip(queries, passages_list, targets):
+                distances, indices = retrieve_passages(query, index)
+                weights = nn.functional.softmax(torch.tensor(distances), dim=0)
+
+                responses = []
+                for idx in indices:
+                    passage = all_passages[idx]
+                    response = generate_response(query, passage)
+                    responses.append(tokenizer.encode(response, return_tensors='pt'))
+
+                weighted_response = weighted_average(responses, weights)
+                target_ids = tokenizer.encode(target, return_tensors='pt')
+
+                loss = criterion(weighted_response.unsqueeze(0), target_ids.unsqueeze(0))
+                batch_loss += loss.item()
+
+            total_loss += batch_loss
+
+    return total_loss / len(dataloader)
+
+# Main training and evaluation
+def main():
+    # Load and preprocess the dataset
+    train_data = load_data('path/to/train/data')
+    val_data = load_data('path/to/val/data')
+
+    # Create DataLoader instances
+    train_dataset = MSMARCODataset(train_data)
+    val_dataset = MSMARCODataset(val_data)
+    train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=8)
+
+    # Set up the device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Set up the optimizer and loss function
+    optimizer = optim.Adam(list(query_encoder.parameters()) + list(llm.parameters()), lr=1e-5)
+    criterion = nn.CrossEntropyLoss()
+
+    # Training and evaluation
+    num_epochs = 10
+    for epoch in range(num_epochs):
+        train(llm, train_dataloader, optimizer, criterion, device)
+        val_loss = evaluate(llm, val_dataloader, device)
+        print(f"Epoch {epoch+1}/{num_epochs} - Validation Loss: {val_loss:.4f}")
+
+if __name__ == '__main__':
+    main()
