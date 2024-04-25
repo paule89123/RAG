@@ -4,9 +4,9 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sentence_transformers import SentenceTransformer
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from datasets import load_dataset
 import faiss
 import numpy as np
-import pandas as pd
 
 # Custom dataset class
 class MSMARCODataset(Dataset):
@@ -17,20 +17,11 @@ class MSMARCODataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        item = self.data.iloc[idx]
+        item = self.data[idx]
         query = item['query']
         passages = item['passages']
         target = item['wellFormedAnswers'][0]
         return query, passages, target
-
-# Load and preprocess the dataset
-def load_data(file_path):
-    data = pd.read_json(file_path, lines=True)
-    data = data[['query', 'passages', 'wellFormedAnswers']]
-    data = data[data['wellFormedAnswers'].map(len) > 0]
-    data = data[data['passages'].map(len) > 0]
-    data = data[data['query'].map(len) > 0]
-    return data
 
 # Initialize the models
 query_encoder = SentenceTransformer('paraphrase-MiniLM-L6-v2')
@@ -39,17 +30,10 @@ llm = GPT2LMHeadModel.from_pretrained('gpt2')
 tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
 
 # Create a FAISS index
-def create_index(passages):
-    embeddings = doc_encoder.encode(passages)
+def create_index(embeddings):
     index = faiss.IndexFlatIP(embeddings.shape[1])
     index.add(embeddings)
     return index
-
-# Retrieve top-k passages
-def retrieve_passages(query, index, k=5):
-    query_embedding = query_encoder.encode([query])
-    distances, indices = index.search(query_embedding, k)
-    return distances[0], indices[0]
 
 # Generate a response using the LLM
 def generate_response(query, passage, max_length=100):
@@ -65,23 +49,26 @@ def weighted_average(responses, weights):
     return torch.sum(weighted_responses, dim=0)
 
 # Training loop
-def train(model, dataloader, optimizer, criterion, device):
-    model.train()
+def train(query_encoder, llm, dataloader, optimizer, criterion, device):
+    query_encoder.train()
+    llm.train()
     for batch in dataloader:
         queries, passages_list, targets = batch
         queries = list(queries)
         targets = list(targets)
 
-        all_passages = [passage for passages in passages_list for passage in passages]
-        index = create_index(all_passages)
+        all_passages = [passage for passages in passages_list for passage in passages['passage_text']]
+        all_passage_embeddings = doc_encoder.encode(all_passages)
+        index = create_index(all_passage_embeddings)
 
         batch_loss = 0
         for query, passages, target in zip(queries, passages_list, targets):
-            distances, indices = retrieve_passages(query, index)
+            query_embedding = query_encoder.encode([query])
+            distances, indices = index.search(query_embedding, k=5)
             weights = nn.functional.softmax(torch.tensor(distances), dim=0)
 
             responses = []
-            for idx in indices:
+            for idx in indices[0]:
                 passage = all_passages[idx]
                 response = generate_response(query, passage)
                 responses.append(tokenizer.encode(response, return_tensors='pt'))
@@ -90,15 +77,16 @@ def train(model, dataloader, optimizer, criterion, device):
             target_ids = tokenizer.encode(target, return_tensors='pt')
 
             loss = criterion(weighted_response.unsqueeze(0), target_ids.unsqueeze(0))
-            batch_loss += loss.item()
+            batch_loss += loss
 
         optimizer.zero_grad()
         batch_loss.backward()
         optimizer.step()
 
 # Evaluation loop
-def evaluate(model, dataloader, device):
-    model.eval()
+def evaluate(query_encoder, llm, dataloader, device):
+    query_encoder.eval()
+    llm.eval()
     total_loss = 0
     with torch.no_grad():
         for batch in dataloader:
@@ -106,16 +94,18 @@ def evaluate(model, dataloader, device):
             queries = list(queries)
             targets = list(targets)
 
-            all_passages = [passage for passages in passages_list for passage in passages]
-            index = create_index(all_passages)
+            all_passages = [passage for passages in passages_list for passage in passages['passage_text']]
+            all_passage_embeddings = doc_encoder.encode(all_passages)
+            index = create_index(all_passage_embeddings)
 
             batch_loss = 0
             for query, passages, target in zip(queries, passages_list, targets):
-                distances, indices = retrieve_passages(query, index)
+                query_embedding = query_encoder.encode([query])
+                distances, indices = index.search(query_embedding, k=5)
                 weights = nn.functional.softmax(torch.tensor(distances), dim=0)
 
                 responses = []
-                for idx in indices:
+                for idx in indices[0]:
                     passage = all_passages[idx]
                     response = generate_response(query, passage)
                     responses.append(tokenizer.encode(response, return_tensors='pt'))
@@ -132,9 +122,13 @@ def evaluate(model, dataloader, device):
 
 # Main training and evaluation
 def main():
-    # Load and preprocess the dataset
-    train_data = load_data('path/to/train/data')
-    val_data = load_data('path/to/val/data')
+    # Load the dataset
+    train_data = load_dataset("ms_marco", "v1.1", split="train")
+    val_data = load_dataset("ms_marco", "v1.1", split="validation")
+
+    # Filter out rows with empty wellFormedAnswers, passages, or query
+    train_data = train_data.filter(lambda x: len(x['wellFormedAnswers']) > 0 and len(x['passages']) > 0 and len(x['query']) > 0)
+    val_data = val_data.filter(lambda x: len(x['wellFormedAnswers']) > 0 and len(x['passages']) > 0 and len(x['query']) > 0)
 
     # Create DataLoader instances
     train_dataset = MSMARCODataset(train_data)
@@ -152,8 +146,8 @@ def main():
     # Training and evaluation
     num_epochs = 10
     for epoch in range(num_epochs):
-        train(llm, train_dataloader, optimizer, criterion, device)
-        val_loss = evaluate(llm, val_dataloader, device)
+        train(query_encoder, llm, train_dataloader, optimizer, criterion, device)
+        val_loss = evaluate(query_encoder, llm, val_dataloader, device)
         print(f"Epoch {epoch+1}/{num_epochs} - Validation Loss: {val_loss:.4f}")
 
 if __name__ == '__main__':
