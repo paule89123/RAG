@@ -129,22 +129,33 @@ def main():
     train_data = train_data.filter(lambda x: len(x['wellFormedAnswers']) > 0 and len(x['passages']) > 0 and len(x['query']) > 0)
     val_data = val_data.filter(lambda x: len(x['wellFormedAnswers']) > 0 and len(x['passages']) > 0 and len(x['query']) > 0)
 
-    # Pre-cache document embeddings
-    train_passage_embeddings = {}
-    for item in train_data:
-        passage_ids = [passage['passage_id'] for passage in item['passages']]
-        passage_texts = [passage['passage_text'] for passage in item['passages']]
-        passage_embeddings = doc_encoder.encode(passage_texts)
-        for passage_id, embedding in zip(passage_ids, passage_embeddings):
-            train_passage_embeddings[passage_id] = embedding
+    # Check if pre-cached embeddings exist, otherwise generate and save them
+    try:
+        train_passage_embeddings = np.load('train_passage_embeddings.npy', allow_pickle=True).item()
+        val_passage_embeddings = np.load('val_passage_embeddings.npy', allow_pickle=True).item()
+        print("Loaded pre-cached passage embeddings.")
+    except FileNotFoundError:
+        print("Pre-cached passage embeddings not found. Generating and saving embeddings...")
+        train_passage_embeddings = {}
+        for item in train_data:
+            passage_ids = [passage['passage_id'] for passage in item['passages']]
+            passage_texts = [passage['passage_text'] for passage in item['passages']]
+            passage_embeddings = doc_encoder.encode(passage_texts)
+            for passage_id, embedding in zip(passage_ids, passage_embeddings):
+                train_passage_embeddings[passage_id] = embedding
 
-    val_passage_embeddings = {}
-    for item in val_data:
-        passage_ids = [passage['passage_id'] for passage in item['passages']]
-        passage_texts = [passage['passage_text'] for passage in item['passages']]
-        passage_embeddings = doc_encoder.encode(passage_texts)
-        for passage_id, embedding in zip(passage_ids, passage_embeddings):
-            val_passage_embeddings[passage_id] = embedding
+        val_passage_embeddings = {}
+        for item in val_data:
+            passage_ids = [passage['passage_id'] for passage in item['passages']]
+            passage_texts = [passage['passage_text'] for passage in item['passages']]
+            passage_embeddings = doc_encoder.encode(passage_texts)
+            for passage_id, embedding in zip(passage_ids, passage_embeddings):
+                val_passage_embeddings[passage_id] = embedding
+
+        # Save the embeddings to files
+        np.save('train_passage_embeddings.npy', train_passage_embeddings, allow_pickle=True)
+        np.save('val_passage_embeddings.npy', val_passage_embeddings, allow_pickle=True)
+        print("Passage embeddings saved.")
 
     # Create DataLoader instances
     train_dataset = MSMARCODataset(train_data, train_passage_embeddings)
