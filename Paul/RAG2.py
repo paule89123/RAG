@@ -10,8 +10,9 @@ import numpy as np
 
 # Custom dataset class
 class MSMARCODataset(Dataset):
-    def __init__(self, data):
+    def __init__(self, data, passage_embeddings):
         self.data = data
+        self.passage_embeddings = passage_embeddings
 
     def __len__(self):
         return len(self.data)
@@ -57,19 +58,18 @@ def train(query_encoder, llm, dataloader, optimizer, criterion, device):
         queries = list(queries)
         targets = list(targets)
 
-        all_passages = [passage for passages in passages_list for passage in passages['passage_text']]
-        all_passage_embeddings = doc_encoder.encode(all_passages)
-        index = create_index(all_passage_embeddings)
-
         batch_loss = 0
         for query, passages, target in zip(queries, passages_list, targets):
+            passage_embeddings = dataloader.dataset.passage_embeddings[passages['passage_id']]
+            index = create_index(passage_embeddings)
+
             query_embedding = query_encoder.encode([query])
             distances, indices = index.search(query_embedding, k=5)
             weights = nn.functional.softmax(torch.tensor(distances), dim=0)
 
             responses = []
             for idx in indices[0]:
-                passage = all_passages[idx]
+                passage = passages['passage_text'][idx]
                 response = generate_response(query, passage)
                 responses.append(tokenizer.encode(response, return_tensors='pt'))
 
@@ -94,19 +94,18 @@ def evaluate(query_encoder, llm, dataloader, device):
             queries = list(queries)
             targets = list(targets)
 
-            all_passages = [passage for passages in passages_list for passage in passages['passage_text']]
-            all_passage_embeddings = doc_encoder.encode(all_passages)
-            index = create_index(all_passage_embeddings)
-
             batch_loss = 0
             for query, passages, target in zip(queries, passages_list, targets):
+                passage_embeddings = dataloader.dataset.passage_embeddings[passages['passage_id']]
+                index = create_index(passage_embeddings)
+
                 query_embedding = query_encoder.encode([query])
                 distances, indices = index.search(query_embedding, k=5)
                 weights = nn.functional.softmax(torch.tensor(distances), dim=0)
 
                 responses = []
                 for idx in indices[0]:
-                    passage = all_passages[idx]
+                    passage = passages['passage_text'][idx]
                     response = generate_response(query, passage)
                     responses.append(tokenizer.encode(response, return_tensors='pt'))
 
@@ -130,9 +129,26 @@ def main():
     train_data = train_data.filter(lambda x: len(x['wellFormedAnswers']) > 0 and len(x['passages']) > 0 and len(x['query']) > 0)
     val_data = val_data.filter(lambda x: len(x['wellFormedAnswers']) > 0 and len(x['passages']) > 0 and len(x['query']) > 0)
 
+    # Pre-cache document embeddings
+    train_passage_embeddings = {}
+    for item in train_data:
+        passage_ids = [passage['passage_id'] for passage in item['passages']]
+        passage_texts = [passage['passage_text'] for passage in item['passages']]
+        passage_embeddings = doc_encoder.encode(passage_texts)
+        for passage_id, embedding in zip(passage_ids, passage_embeddings):
+            train_passage_embeddings[passage_id] = embedding
+
+    val_passage_embeddings = {}
+    for item in val_data:
+        passage_ids = [passage['passage_id'] for passage in item['passages']]
+        passage_texts = [passage['passage_text'] for passage in item['passages']]
+        passage_embeddings = doc_encoder.encode(passage_texts)
+        for passage_id, embedding in zip(passage_ids, passage_embeddings):
+            val_passage_embeddings[passage_id] = embedding
+
     # Create DataLoader instances
-    train_dataset = MSMARCODataset(train_data)
-    val_dataset = MSMARCODataset(val_data)
+    train_dataset = MSMARCODataset(train_data, train_passage_embeddings)
+    val_dataset = MSMARCODataset(val_data, val_passage_embeddings)
     train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True)
     val_dataloader = DataLoader(val_dataset, batch_size=8)
 
