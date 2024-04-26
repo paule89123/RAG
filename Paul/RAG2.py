@@ -51,37 +51,38 @@ def weighted_average(responses, weights):
 
 # Training loop
 def train(query_encoder, llm, dataloader, optimizer, criterion, device):
-    query_encoder.train()
-    llm.train()
+    # query_encoder.train()
+    # llm.train()
     for batch in dataloader:
         queries, passages_list, targets = batch
         queries = list(queries)
         targets = list(targets)
+        print("1,,")
 
-        batch_loss = 0
-        for query, passages, target in zip(queries, passages_list, targets):
-            passage_embeddings = dataloader.dataset.passage_embeddings[passages['passage_id']]
-            index = create_index(passage_embeddings)
+        # batch_loss = 0
+        # for query, passages, target in zip(queries, passages_list, targets):
+        #     passage_embeddings = dataloader.dataset.passage_embeddings[passages['passage_id']]
+        #     index = create_index(passage_embeddings)
 
-            query_embedding = query_encoder.encode([query])
-            distances, indices = index.search(query_embedding, k=5)
-            weights = nn.functional.softmax(torch.tensor(distances), dim=0)
+        #     query_embedding = query_encoder.encode([query])
+        #     distances, indices = index.search(query_embedding, k=5)
+        #     weights = nn.functional.softmax(torch.tensor(distances), dim=0)
 
-            responses = []
-            for idx in indices[0]:
-                passage = passages['passage_text'][idx]
-                response = generate_response(query, passage)
-                responses.append(tokenizer.encode(response, return_tensors='pt'))
+        #     responses = []
+        #     for idx in indices[0]:
+        #         passage = passages['passage_text'][idx]
+        #         response = generate_response(query, passage)
+        #         responses.append(tokenizer.encode(response, return_tensors='pt'))
 
-            weighted_response = weighted_average(responses, weights)
-            target_ids = tokenizer.encode(target, return_tensors='pt')
+        #     weighted_response = weighted_average(responses, weights)
+        #     target_ids = tokenizer.encode(target, return_tensors='pt')
 
-            loss = criterion(weighted_response.unsqueeze(0), target_ids.unsqueeze(0))
-            batch_loss += loss
+        #     loss = criterion(weighted_response.unsqueeze(0), target_ids.unsqueeze(0))
+        #     batch_loss += loss
 
-        optimizer.zero_grad()
-        batch_loss.backward()
-        optimizer.step()
+        # optimizer.zero_grad()
+        # batch_loss.backward()
+        # optimizer.step()
 
 # Evaluation loop
 def evaluate(query_encoder, llm, dataloader, device):
@@ -122,8 +123,8 @@ def evaluate(query_encoder, llm, dataloader, device):
 # Main training and evaluation
 def main():
     # Load the dataset
-    train_data = load_dataset("ms_marco", "v1.1", split="train")
-    val_data = load_dataset("ms_marco", "v1.1", split="validation")
+    train_data = load_dataset("ms_marco", "v2.1", split="train[:4000]")
+    val_data = load_dataset("ms_marco", "v2.1", split="validation[:4000]")
 
     # Filter out rows with empty wellFormedAnswers, passages, or query
     train_data = train_data.filter(lambda x: len(x['wellFormedAnswers']) > 0 and len(x['passages']) > 0 and len(x['query']) > 0)
@@ -136,21 +137,30 @@ def main():
         print("Loaded pre-cached passage embeddings.")
     except FileNotFoundError:
         print("Pre-cached passage embeddings not found. Generating and saving embeddings...")
-        train_passage_embeddings = {}
-        for item in train_data:
-            passage_ids = [passage['passage_id'] for passage in item['passages']]
-            passage_texts = [passage['passage_text'] for passage in item['passages']]
-            passage_embeddings = doc_encoder.encode(passage_texts)
-            for passage_id, embedding in zip(passage_ids, passage_embeddings):
-                train_passage_embeddings[passage_id] = embedding
+        # train_passage_embeddings = {}
+        # for item in train_data:
+        #     passage_ids = [passage['passage_id'] for passage in item['passages']]
+        #     passage_texts = [passage['passage_text'] for passage in item['passages']]
+        #     passage_embeddings = doc_encoder.encode(passage_texts)
+        #     for passage_id, embedding in zip(passage_ids, passage_embeddings):
+        #         train_passage_embeddings[passage_id] = embedding
 
-        val_passage_embeddings = {}
+        # val_passage_embeddings = {}
+        # for item in val_data:
+        #     passage_ids = [passage['passage_id'] for passage in item['passages']]
+        #     passage_texts = [passage['passage_text'] for passage in item['passages']]
+        #     passage_embeddings = doc_encoder.encode(passage_texts)
+        #     for passage_id, embedding in zip(passage_ids, passage_embeddings):
+        #         val_passage_embeddings[passage_id] = embedding
+        train_passage_embeddings = []
+        for item in train_data:
+            passage_texts = [passage for passage in item['passages']['passage_text']]
+            train_passage_embeddings = doc_encoder.encode(passage_texts, show_progress_bar=True, batch_size=100, device = device, convert_to_numpy=True)
+
+        val_passage_embeddings = []
         for item in val_data:
-            passage_ids = [passage['passage_id'] for passage in item['passages']]
-            passage_texts = [passage['passage_text'] for passage in item['passages']]
-            passage_embeddings = doc_encoder.encode(passage_texts)
-            for passage_id, embedding in zip(passage_ids, passage_embeddings):
-                val_passage_embeddings[passage_id] = embedding
+            passage_texts = [passage for passage in item['passages']['passage_text']]
+            val_passage_embeddings = doc_encoder.encode(passage_texts, show_progress_bar=True, batch_size=100, device = device, convert_to_numpy=True)
 
         # Save the embeddings to files
         np.save('train_passage_embeddings.npy', train_passage_embeddings, allow_pickle=True)
@@ -174,8 +184,8 @@ def main():
     num_epochs = 10
     for epoch in range(num_epochs):
         train(query_encoder, llm, train_dataloader, optimizer, criterion, device)
-        val_loss = evaluate(query_encoder, llm, val_dataloader, device)
-        print(f"Epoch {epoch+1}/{num_epochs} - Validation Loss: {val_loss:.4f}")
+        # val_loss = evaluate(query_encoder, llm, val_dataloader, device)
+        # print(f"Epoch {epoch+1}/{num_epochs} - Validation Loss: {val_loss:.4f}")
 
 if __name__ == '__main__':
     main()
